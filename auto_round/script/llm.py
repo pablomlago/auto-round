@@ -325,6 +325,107 @@ def setup_eval_parser():
     args = parser.parse_args()
     return args
 
+def brevitas_eval(model, tokenizer, device_str, args):
+    import torch
+    from brevitas_examples.llm.llm_quant.data_utils import get_dataset_for_model
+    from brevitas_examples.llm.llm_quant.eval import compute_perplexity
+    from auto_round.utils import detect_device
+
+    # Add Brevitas evaluation for consistency
+    print("Model eval...")
+
+    # Move mode to appropiate device
+    if hasattr(model, "hf_device_map") and len(model.hf_device_map) > 1:
+        from accelerate.big_modeling import dispatch_model
+
+        dispatch_model(model, model.hf_device_map)
+    else:
+        device_str = detect_device(device_str)
+        model = model.to(device_str)
+    eval_model_dtype = get_model_dtype(args.eval_model_dtype, "auto")
+    if model.dtype != eval_model_dtype and eval_model_dtype != "auto":
+        model.to(getattr(torch, eval_model_dtype))
+
+    validation_loader = get_dataset_for_model(
+        args.model,
+        dataset_name="wikitext2",
+        tokenizer=tokenizer,
+        nsamples=args.nsamples,
+        seqlen=args.seqlen,
+        split="validation",
+        seed=args.seed,
+        require_fx=False,
+        device=next(model.parameters()).device)
+    with torch.no_grad():
+        quant_ppl = compute_perplexity(
+            model, validation_loader, context_length=args.seqlen // 2, tokenizer=tokenizer)
+    print(f"Quantized perplexity ({args.dataset}): {quant_ppl:.3f}")
+
+        
+    def filter_results(results, tasks):
+        # filter out what we actually want to track
+        eval_results = dict()
+        for task_name in tasks:
+            # log all result metrics we have for this task
+            for key, val in results["results"][task_name].items():
+                if not isinstance(val, str):
+                    # for mmlu, we don't log results per subtask, but simply overall results
+                    name = f"{task_name}_{key}"
+                    eval_results[name] = val
+        return eval_results
+
+    args.few_shot_limit = None
+    args.few_shot_override_batch_size = 16
+    args.few_shot_tasks = ['leaderboard|arc:challenge|0|0', 'leaderboard|winogrande|0|0', 'lighteval|arc:easy|0|0', 'leaderboard|hellaswag|0|0', 'lighteval|piqa|0|0']
+    args.few_shot_zeroshot = True
+
+    import pprint
+    from accelerate import Accelerator
+    from accelerate import InitProcessGroupKwargs
+    from huggingface_hub import constants
+    from lighteval.logging.evaluation_tracker import EvaluationTracker
+    from lighteval.models.transformers.transformers_model import TransformersModelConfig
+    from lighteval.pipeline import ParallelismManager
+    from lighteval.pipeline import Pipeline
+    from lighteval.pipeline import PipelineParameters
+    from lighteval.utils.utils import EnvConfig
+    from datetime import timedelta
+    with torch.no_grad():
+        # expects a list
+        few_shot_tasks = ",".join(args.few_shot_tasks)
+        accelerator = Accelerator(
+            kwargs_handlers=[InitProcessGroupKwargs(timeout=timedelta(seconds=3000))])
+        evaluation_tracker = EvaluationTracker(output_dir=args.output_dir, save_details=True)
+        pipeline_params = PipelineParameters(
+            launcher_type=ParallelismManager.ACCELERATE,
+            env_config=EnvConfig(cache_dir=constants.HF_HUB_CACHE),
+            override_batch_size=args.few_shot_override_batch_size)
+        model_config = TransformersModelConfig(
+            pretrained=args.model,
+            dtype=next(model.parameters()).dtype,
+            model_parallel=True,
+            accelerator=accelerator)
+        pipeline = Pipeline(
+            tasks=few_shot_tasks,
+            pipeline_parameters=pipeline_params,
+            evaluation_tracker=evaluation_tracker,
+            model=model,
+            config=model_config)
+        pipeline.evaluate()
+    few_shot_eval_results = pipeline.get_results()
+    few_shot_eval_results = filter_results(
+        few_shot_eval_results, list(few_shot_eval_results["results"].keys()))
+    pprint.pprint(few_shot_eval_results)
+
+    results = few_shot_eval_results
+    results["quant_ppl"] = float(quant_ppl)
+
+    import yaml
+    with open(f"{args.output_dir}/run_results.yaml", 'w') as f:
+        yaml.dump(results, f)
+
+
+    exit()
 
 def tune(args):
     if args.disable_eval:
@@ -511,6 +612,9 @@ def tune(args):
 
     model.eval()
     clear_memory()
+
+    # Add Brevitas validation
+    brevitas_eval(model, tokenizer, device_str, args)
 
     lm_eval_version = get_library_version("lm-eval")
 

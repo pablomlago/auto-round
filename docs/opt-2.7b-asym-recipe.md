@@ -2,17 +2,7 @@
 
 A sample command to generate an INT4 model.
 ```bash
-auto-round \
---model   facebook/opt-2.7b \
---device 0 \
---group_size 128 \
---bits 4 \
---iters 1000 \
---nsamples 512 \
---minmax_lr 2e-3 \
---asym \
---format 'auto_gptq,auto_round' \
---output_dir "./tmp_autoround"
+auto-round --model facebook/opt-125m --device 0 --group_size 128 --bits 4 --iters 1000 --nsamples 512 --minmax_lr 2e-3 --asym --format 'auto_round' --output_dir "./tmp_autoround"
 ```
 
 
